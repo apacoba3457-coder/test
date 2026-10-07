@@ -1,0 +1,512 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>Gesture Hand — Black Hole & Fire</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #05060a;
+      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      color: white;
+    }
+    #stage {
+      position: fixed;
+      inset: 0;
+      background: radial-gradient(circle at 50% 45%, #111526 0%, #070912 40%, #020308 100%);
+    }
+    #video {
+      position: absolute;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      transform: scaleX(-1);
+      filter: saturate(.82) contrast(1.08) brightness(.72);
+    }
+    #fx {
+      position: absolute;
+      inset: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;
+    }
+    #hud {
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      right: 16px;
+      z-index: 5;
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      gap: 12px;
+      pointer-events: none;
+    }
+    .panel {
+      background: rgba(5, 8, 16, .58);
+      border: 1px solid rgba(255,255,255,.12);
+      box-shadow: 0 12px 35px rgba(0,0,0,.34);
+      border-radius: 16px;
+      padding: 11px 14px;
+      backdrop-filter: blur(12px);
+    }
+    #title {
+      font-size: 14px;
+      font-weight: 750;
+      letter-spacing: .03em;
+    }
+    #hint {
+      margin-top: 4px;
+      font-size: 12px;
+      opacity: .72;
+    }
+    #status {
+      min-width: 160px;
+      text-align: center;
+      font-size: 13px;
+      font-weight: 700;
+    }
+    #startBtn {
+      position: fixed;
+      left: 50%;
+      top: 50%;
+      transform: translate(-50%, -50%);
+      z-index: 10;
+      border: 0;
+      border-radius: 999px;
+      padding: 15px 22px;
+      color: white;
+      background: linear-gradient(135deg, #15182a, #292e57);
+      box-shadow: 0 14px 40px rgba(0,0,0,.45);
+      font-size: 15px;
+      font-weight: 800;
+      cursor: pointer;
+    }
+    #startBtn.hidden { display: none; }
+    #error {
+      position: fixed;
+      left: 50%;
+      bottom: 18px;
+      transform: translateX(-50%);
+      z-index: 11;
+      display: none;
+      width: min(92vw, 620px);
+      padding: 12px 14px;
+      background: rgba(80, 12, 18, .82);
+      border: 1px solid rgba(255,100,100,.2);
+      border-radius: 12px;
+      font-size: 12px;
+      line-height: 1.45;
+      text-align: center;
+      backdrop-filter: blur(8px);
+    }
+  </style>
+</head>
+<body>
+  <div id="stage">
+    <video id="video" playsinline muted></video>
+    <canvas id="fx"></canvas>
+  </div>
+
+  <div id="hud">
+    <div class="panel">
+      <div id="title">GESTURE HAND FX</div>
+      <div id="hint">1 jari → Black Hole · 2 jari → Fire</div>
+    </div>
+    <div class="panel" id="status">Kamera belum aktif</div>
+  </div>
+
+  <button id="startBtn">Aktifkan Kamera</button>
+  <div id="error"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/hands/hands.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js"></script>
+
+  <script>
+    const video = document.getElementById("video");
+    const canvas = document.getElementById("fx");
+    const ctx = canvas.getContext("2d", { alpha: true });
+    const startBtn = document.getElementById("startBtn");
+    const statusEl = document.getElementById("status");
+    const errorEl = document.getElementById("error");
+
+    let W = innerWidth;
+    let H = innerHeight;
+    let running = false;
+    let handsReady = false;
+    let latestHands = [];
+    let lastFrameTime = performance.now();
+
+    const blackHoleParticles = [];
+    const fireParticles = [];
+
+    function resize() {
+      const dpr = Math.min(devicePixelRatio || 1, 2);
+      W = innerWidth; H = innerHeight;
+      canvas.width = Math.floor(W * dpr);
+      canvas.height = Math.floor(H * dpr);
+      canvas.style.width = W + "px";
+      canvas.style.height = H + "px";
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    addEventListener("resize", resize);
+    resize();
+
+    function showError(msg) {
+      errorEl.textContent = msg;
+      errorEl.style.display = "block";
+    }
+
+    // Jari 1/2 dihitung dari index, middle, ring, pinky.
+    // Ibu jari sengaja tidak dihitung agar gesture lebih mudah dipakai.
+    function countRaisedFingers(lm) {
+      const fingers = [
+        [8, 6],   // index
+        [12, 10], // middle
+        [16, 14], // ring
+        [20, 18]  // pinky
+      ];
+      let count = 0;
+      for (const [tip, pip] of fingers) {
+        if (lm[tip].y < lm[pip].y - 0.015) count++;
+      }
+      return count;
+    }
+
+    function pxPoint(p) {
+      // Video/canvas dimirror secara visual, jadi x dibalik agar efek pas dengan tangan di layar.
+      return { x: (1 - p.x) * W, y: p.y * H };
+    }
+
+    function distance(a, b) {
+      const dx = a.x - b.x, dy = a.y - b.y;
+      return Math.hypot(dx, dy);
+    }
+
+    function addBlackHoleParticles(x, y, scale) {
+      const n = Math.max(2, Math.round(scale * 0.16));
+      for (let i = 0; i < n; i++) {
+        const a = Math.random() * Math.PI * 2;
+        const r = 12 + Math.random() * 46 * scale;
+        blackHoleParticles.push({
+          x: x + Math.cos(a) * r,
+          y: y + Math.sin(a) * r * 0.52,
+          vx: Math.cos(a) * (0.4 + Math.random() * 1.4),
+          vy: Math.sin(a) * (0.15 + Math.random() * 0.65),
+          life: 1,
+          max: 0.4 + Math.random() * 0.9,
+          size: 0.7 + Math.random() * 2.5
+        });
+      }
+    }
+
+    function addFireParticles(x, y, scale) {
+      const n = Math.max(3, Math.round(2 + scale * 0.2));
+      for (let i = 0; i < n; i++) {
+        fireParticles.push({
+          x: x + (Math.random() - .5) * 18 * scale,
+          y: y + Math.random() * 6 * scale,
+          vx: (Math.random() - .5) * 0.75,
+          vy: -(1.2 + Math.random() * 2.8) * scale,
+          life: 0.8 + Math.random() * 0.8,
+          size: (2 + Math.random() * 7) * Math.min(1.5, scale)
+        });
+      }
+    }
+
+    function drawGlowCircle(x, y, r, colorStops) {
+      const g = ctx.createRadialGradient(x, y, 0, x, y, r);
+      for (const stop of colorStops) g.addColorStop(stop[0], stop[1]);
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.arc(x, y, r, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    function drawBlackHole(x, y, handScale, time) {
+      const r = Math.max(34, handScale * 0.36);
+
+      // Glow
+      drawGlowCircle(x, y, r * 1.8, [
+        [0, "rgba(60, 35, 255, .18)"],
+        [.55, "rgba(25, 8, 100, .10)"],
+        [1, "rgba(0,0,0,0)"]
+      ]);
+
+      ctx.save();
+      ctx.translate(x, y);
+
+      // Accretion disk: two glowing flattened ellipses.
+      for (let k = 0; k < 2; k++) {
+        ctx.rotate((k ? -1 : 1) * 0.16);
+        ctx.beginPath();
+        ctx.ellipse(0, 0, r * 1.72, r * .58, 0, 0, Math.PI * 2);
+        ctx.lineWidth = Math.max(5, r * .12);
+        ctx.strokeStyle = k ? "rgba(88,145,255,.48)" : "rgba(196,90,255,.78)";
+        ctx.shadowBlur = r * .5;
+        ctx.shadowColor = k ? "rgba(50,120,255,.8)" : "rgba(190,40,255,.75)";
+        ctx.stroke();
+      }
+
+      // Spiral rings.
+      ctx.shadowBlur = r * .25;
+      for (let ring = 0; ring < 4; ring++) {
+        const rr = r * (0.72 + ring * .19);
+        ctx.beginPath();
+        for (let i = 0; i <= 100; i++) {
+          const a = i / 100 * Math.PI * 2 + time * (0.0012 + ring * .00035);
+          const wobble = 1 + Math.sin(a * 4 + time * .001) * .025;
+          const px = Math.cos(a) * rr * wobble;
+          const py = Math.sin(a) * rr * .38 * wobble;
+          if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+        }
+        ctx.strokeStyle = `rgba(${120 + ring*30}, ${120 - ring*15}, 255, ${.16 + ring*.06})`;
+        ctx.lineWidth = Math.max(1, r * .024);
+        ctx.stroke();
+      }
+
+      // Event horizon.
+      ctx.shadowBlur = r * .28;
+      ctx.shadowColor = "rgba(110,100,255,.65)";
+      ctx.fillStyle = "#000";
+      ctx.beginPath();
+      ctx.arc(0, 0, r * .67, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.restore();
+
+      addBlackHoleParticles(x, y, handScale);
+
+      for (let i = blackHoleParticles.length - 1; i >= 0; i--) {
+        const p = blackHoleParticles[i];
+        const dx = x - p.x, dy = y - p.y;
+        const d = Math.max(16, Math.hypot(dx, dy));
+        const force = Math.min(3.0, 120 / d);
+        p.vx += dx / d * force * .035;
+        p.vy += dy / d * force * .035;
+        p.x += p.vx;
+        p.y += p.vy;
+        p.life -= 0.018 / p.max;
+        if (p.life <= 0 || d < r * .55) {
+          blackHoleParticles.splice(i, 1);
+          continue;
+        }
+        ctx.fillStyle = `rgba(180,195,255,${Math.max(0, p.life) * .65})`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      if (blackHoleParticles.length > 900) blackHoleParticles.splice(0, 200);
+    }
+
+    function drawFlame(x, y, scale, time) {
+      // y adalah ujung jari; api muncul di ATAS ujung jari.
+      const baseY = y - 5 * scale;
+      const flameH = Math.max(52, 72 * scale);
+      const flameW = Math.max(24, 34 * scale);
+
+      drawGlowCircle(x, baseY - flameH * .52, flameW * 1.25, [
+        [0, "rgba(255,120,30,.22)"],
+        [.5, "rgba(255,55,0,.10)"],
+        [1, "rgba(0,0,0,0)"]
+      ]);
+
+      // Outer flame
+      const wobble = Math.sin(time * .012 + x * .01) * 4 * scale;
+      const grad = ctx.createRadialGradient(x + wobble, baseY - flameH*.4, 3, x, baseY - flameH*.35, flameH);
+      grad.addColorStop(0, "rgba(255,255,220,.98)");
+      grad.addColorStop(.22, "rgba(255,224,76,.98)");
+      grad.addColorStop(.55, "rgba(255,91,18,.94)");
+      grad.addColorStop(1, "rgba(255,20,0,0)");
+
+      ctx.fillStyle = grad;
+      ctx.beginPath();
+      ctx.moveTo(x, baseY + 5);
+      ctx.bezierCurveTo(
+        x - flameW*.75, baseY - flameH*.18,
+        x - flameW*.60 + wobble, baseY - flameH*.66,
+        x - flameW*.10, baseY - flameH
+      );
+      ctx.bezierCurveTo(
+        x - flameW*.03, baseY - flameH*.50,
+        x + flameW*.30 + wobble, baseY - flameH*.56,
+        x + flameW*.48, baseY - flameH*.24
+      );
+      ctx.bezierCurveTo(
+        x + flameW*.75, baseY + 2,
+        x + flameW*.28, baseY + 7,
+        x, baseY + 5
+      );
+      ctx.fill();
+
+      // Inner flame
+      ctx.fillStyle = "rgba(255,255,225,.94)";
+      ctx.beginPath();
+      ctx.moveTo(x, baseY);
+      ctx.bezierCurveTo(
+        x - flameW*.32, baseY - flameH*.18,
+        x - flameW*.25, baseY - flameH*.48,
+        x - flameW*.05, baseY - flameH*.66
+      );
+      ctx.bezierCurveTo(
+        x + flameW*.02, baseY - flameH*.40,
+        x + flameW*.22, baseY - flameH*.32,
+        x + flameW*.28, baseY - flameH*.10
+      );
+      ctx.bezierCurveTo(x + flameW*.30, baseY, x + flameW*.15, baseY + 2, x, baseY);
+      ctx.fill();
+
+      addFireParticles(x, baseY - flameH*.25, scale);
+      for (let i = fireParticles.length - 1; i >= 0; i--) {
+        const p = fireParticles[i];
+        p.x += p.vx;
+        p.y += p.vy;
+        p.vy *= .992;
+        p.vy += .025;
+        p.life -= .026;
+        if (p.life <= 0 || p.y < -30) {
+          fireParticles.splice(i, 1);
+          continue;
+        }
+        const a = p.life * .5;
+        ctx.fillStyle = `rgba(255,${Math.floor(100 + 130*p.life)},40,${a})`;
+        ctx.beginPath();
+        ctx.arc(p.x, p.y, p.size * p.life, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      if (fireParticles.length > 700) fireParticles.splice(0, 180);
+    }
+
+    function drawFingerPointer(x, y) {
+      drawGlowCircle(x, y, 15, [
+        [0, "rgba(255,255,255,.18)"],
+        [.6, "rgba(255,255,255,.06)"],
+        [1, "rgba(0,0,0,0)"]
+      ]);
+      ctx.fillStyle = "rgba(255,255,255,.78)";
+      ctx.beginPath();
+      ctx.arc(x, y, 2.6, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    function render(now) {
+      const dt = Math.min(34, now - lastFrameTime);
+      lastFrameTime = now;
+      ctx.clearRect(0, 0, W, H);
+
+      let mode = "Tangan tidak terdeteksi";
+      if (latestHands.length) {
+        for (const hand of latestHands) {
+          const lm = hand.landmarks;
+          const count = hand.count;
+          const tips = [8, 12, 16, 20].filter((tip, i) => {
+            const pip = [6, 10, 14, 18][i];
+            return lm[tip].y < lm[pip].y - .015;
+          }).map(i => pxPoint(lm[i]));
+
+          // Ukuran relatif tangan untuk scaling efek.
+          const handScale = Math.max(
+            65,
+            distance(pxPoint(lm[5]), pxPoint(lm[17])) * 4.4
+          );
+
+          if (count === 1 && tips[0]) {
+            const p = tips[0];
+            mode = "1 JARI · BLACK HOLE";
+            drawBlackHole(p.x, p.y, handScale, now);
+            drawFingerPointer(p.x, p.y);
+          } else if (count === 2 && tips.length >= 2) {
+            mode = "2 JARI · FIRE";
+            for (const p of tips.slice(0, 2)) {
+              drawFlame(p.x, p.y, handScale / 150, now);
+              drawFingerPointer(p.x, p.y);
+            }
+          } else if (count >= 3) {
+            mode = `${count} JARI · SIAP`;
+            for (const p of tips) drawFingerPointer(p.x, p.y);
+          }
+        }
+      }
+      statusEl.textContent = mode;
+      requestAnimationFrame(render);
+    }
+    requestAnimationFrame(render);
+
+    const hands = new Hands({
+      locateFile: (file) => `https://cdn.jsdelivr.net/npm/@mediapipe/hands/${file}`
+    });
+
+    hands.setOptions({
+      maxNumHands: 2,
+      modelComplexity: 1,
+      minDetectionConfidence: 0.62,
+      minTrackingConfidence: 0.55
+    });
+
+    hands.onResults((results) => {
+      latestHands = [];
+      if (!results.multiHandLandmarks) return;
+
+      for (const lm of results.multiHandLandmarks) {
+        latestHands.push({
+          landmarks: lm,
+          count: countRaisedFingers(lm)
+        });
+      }
+    });
+
+    let camera;
+
+    async function start() {
+      errorEl.style.display = "none";
+      startBtn.classList.add("hidden");
+      statusEl.textContent = "Meminta izin kamera…";
+
+      try {
+        if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+          throw new Error("Browser ini tidak mendukung akses kamera.");
+        }
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: {
+            facingMode: "user",
+            width: { ideal: 1280 },
+            height: { ideal: 720 }
+          },
+          audio: false
+        });
+
+        video.srcObject = stream;
+        await video.play();
+
+        camera = new Camera(video, {
+          onFrame: async () => {
+            await hands.send({ image: video });
+          },
+          width: 1280,
+          height: 720
+        });
+        camera.start();
+
+        running = true;
+        handsReady = true;
+        statusEl.textContent = "Arahkan tangan ke kamera";
+      } catch (err) {
+        console.error(err);
+        startBtn.classList.remove("hidden");
+        statusEl.textContent = "Kamera gagal aktif";
+        showError("Tidak bisa mengakses kamera. Pastikan izin kamera diizinkan, lalu buka ulang halaman ini. " + (err.message || ""));
+      }
+    }
+
+    startBtn.addEventListener("click", start);
+
+    // Start render even before camera, so UI is responsive.
+    statusEl.textContent = "Tekan “Aktifkan Kamera”";
+  </script>
+</body>
+    </html>
+    
